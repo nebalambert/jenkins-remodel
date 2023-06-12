@@ -1,0 +1,94 @@
+pipeline {
+    agent { label 'ec2slave-t2med' }
+
+    environment {
+        def packageJSON = readJSON file: 'package.json'
+        def PROJECT_NAME ="${packageJSON['name']}"
+        def BUILD_S3_BUCKET = 'pdx-sam-build-bucket-dev'
+        def buildCredId = getCredentialsId(["action": "getCredentialId", "envType": "devUS"])
+    }
+
+    stages {
+
+        stage('Setting build info'){
+            steps {
+                // Calling this shared library function to get details of use who triggered the build
+               setBuildUserInfo()
+                script {
+                    //Set build decription for simplicity to identify who triggered build with which branch
+                    currentBuild.description = "${BUILD_USER}-${branch}"
+                   slackNotifier('STARTED','#redux-build-deployments', "Deployment started for ${PROJECT_NAME} on ${ENV} for build ${buildVersion}")
+                }
+            }
+        }
+        
+        stage('Setting build bucket for release'){
+        	 when { 
+             	anyOf {
+                    expression { params.TIER == 'testUS' }
+                    expression { params.TIER == 'testEU' }
+                    expression { params.TIER == 'prodUS' }
+                    expression { params.TIER == 'prodEU' }
+            	}
+            }
+            steps {
+                script {
+                	BUILD_S3_BUCKET = "pdx-sam-build-bucket-release"
+                    buildCredId = getCredentialsId(["action": "getCredentialId", "envType": "prodUS"])
+                    log.info("Build bucket for "+ TIER +" : "+ BUILD_S3_BUCKET)
+                    log.info("Build credentials for "+ TIER +" : "+ buildCredId)
+                }
+            }
+        }
+
+        stage('Copying mappings file to s3'){
+            steps {
+                script {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: buildCredId, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh(returnStdout: true, script: "aws s3 cp ${WORKSPACE}/devops/deploy/mappings s3://${BUILD_S3_BUCKET}/${PROJECT_NAME}/mappings --recursive ")  
+                    }
+                }
+            }
+        }
+        stage('Checking if build exists in s3'){
+            steps {
+                script {
+                	withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: buildCredId, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                            S3_CHECK_STATUS = sh(returnStatus: true, script: "aws s3 ls s3://${BUILD_S3_BUCKET}/${PROJECT_NAME}/${buildVersion}/")
+                            if(S3_CHECK_STATUS == 0)
+                                log.info("Build Found at ${PROJECT_NAME}/${buildVersion}/")
+                            else 
+                                error("Build doesn't exist at ${PROJECT_NAME}/${buildVersion}/")  
+                        }
+                }
+            }
+        }
+        stage('Copying the packaged.yaml to workspace'){
+            steps {
+                script {
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: buildCredId, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh(returnStdout: true, script: "aws s3 cp s3://${BUILD_S3_BUCKET}/${PROJECT_NAME}/${buildVersion}/packaged.yaml ${WORKSPACE}/packaged.yaml")  
+                    }
+                }
+            }
+        }
+        stage('Sam deploy'){
+            steps {
+                script {
+					def credId = getCredentialsId(["action": "getCredentialId", "envType": TIER])
+        			def region = getCredentialsId(["action": "getCredentialRegion", "envType": TIER])
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: credId, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh "sam deploy -t packaged.yaml --region ${region} --stack-name ${ENV}-${PROJECT_NAME} --capabilities CAPABILITY_NAMED_IAM --parameter-overrides EnvironmentName=${ENV} ProjectName=${PROJECT_NAME} S3BucketName=${BUILD_S3_BUCKET}" 
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                slackNotifier(currentBuild.currentResult, '#redux-build-deployments', "Deployment ${currentBuild.currentResult} for ${PROJECT_NAME} on ${ENV} for build ${buildVersion}")
+            }
+        }
+    }
+}
