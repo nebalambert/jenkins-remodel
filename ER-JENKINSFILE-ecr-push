@@ -1,0 +1,197 @@
+pipeline {
+    agent {node { label 'ec2slave-t2med' } }
+    options {
+        timestamps()
+    }
+parameters {
+   choice(name: 'OPERATION_ENV', choices: 'dev\ntest\nprod', description: 'OPERATION_ENV')
+   string(name: 'BRANCH_NAME', defaultValue: '', description: 'Enter name of git Branch')
+}
+environment {
+        def scannerHome = tool 'sonarqube87'
+        def PROJECT_NAME = 'SimpleF'
+        def SONAR_QGATE = 'Sonar way - SP'
+        def SNYK_TOKEN_ID = 'red-snyk-api-token'
+        def buildVersion = '1'
+        PATH = "${env.WORKSPACE}/bin:/usr/local/bin/:${env.PATH}"
+        // Workspace kube config so we don't affect other Jenkins jobs
+        KUBECONFIG = "${env.WORKSPACE}/.kube/config"
+    }
+    stages {
+         stage('Checkout from git files') {
+            steps {
+                echo "Cloning reportof report"
+                sshagent(['gitsshkey']) {
+
+                        sh """
+                        rm -rf $WORKSPACE/* || true
+                        git clone --branch $BRANCH_NAME $GIT_REPO
+                        sudo mv $DOCKER_FILE_LOCATION/* $WORKSPACE/
+                        """
+                }
+            }
+        }
+       /* stage('Setup kubectl and helm') {
+            steps {
+              script {
+                plan = params.cluster + '.plan'
+                println "Getting the kubectl and helm binaries..."
+                sh """
+                [ ! -d bin ] && mkdir bin
+                ( cd bin
+                # 'latest' kubectl is backward compatible with older api versions
+                curl -LO https://dl.k8s.io/release/v1.23.0/bin/linux/amd64/kubectl
+                curl -fsSL -o - https://get.helm.sh/helm-v3.9.0-linux-amd64.tar.gz | tar -xzf - linux-amd64/helm
+                mv linux-amd64/helm .
+                rm -rf linux-amd64
+                chmod u+x kubectl helm
+                ls -l kubectl helm )
+                sudo yum install jq -y
+                """
+           }
+      }
+    }*/
+        stage('Docker Build') {
+            steps {
+                script {
+                    echo "Docker build step"
+                    dockerImage = dockerOperations([action: 'build', registry: env.OPERATION_ENV, dockerImageName: "${ECR_REPO_NAME}", dockerImageTag: "${DOCKER_IMAGE_TAG_NAME}"])
+                }
+            }
+        }
+         stage('Check Image is already exists') {
+            steps {
+                script {
+                    echo "Checking image '${DOCKER_IMAGE_TAG_NAME}' is already present in ECR with same name in repository ${ECR_REPO_NAME}"
+                    skipRemainingStages = true
+                    try {
+                        sh "aws ecr describe-images --repository-name=${ECR_REPO_NAME} --image-ids=imageTag=${DOCKER_IMAGE_TAG_NAME} --region=${REGION} > foundImage"
+                        echo "Image is already present in ECR= ${ECR_REPO_NAME}:${DOCKER_IMAGE_TAG_NAME}. Stopping to push image with same name."
+                        skipRemainingStages = true
+                    }
+                    catch (Exception exc) {
+                        println("Exception block: ${exc}")
+                        echo "Image is not present. Creating and pushing image to ECR= ${ECR_REPO_NAME}:${DOCKER_IMAGE_TAG_NAME}"
+                        skipRemainingStages = false
+                    }
+
+                    if (skipRemainingStages) {
+                        currentBuild.result = 'FAILURE'
+                        error("Stopped image build. Image is already present in the ECR. Name='${ECR_REPO_NAME}:${DOCKER_IMAGE_TAG_NAME}'")
+                    }
+                }
+            }
+        }
+       /* stage("npm install"){
+            steps{
+                script{
+                    sh "sudo yum install npm --skip-broken -y"
+                }
+                
+            }
+        }*/
+
+        stage("Running Synk Checks"){
+             steps{
+                 script{
+                     snykSecurity(
+                         snykInstallation: 'snyk',
+                         snykTokenId: SNYK_TOKEN_ID,
+                         projectName: PROJECT_NAME,
+                         severity: 'high'
+                     )
+                 }
+             }
+        }
+      stage("npm install"){
+            steps{
+                script{
+                    sh "sudo yum install npm --skip-broken -y"
+                }
+                
+            }
+        }
+
+         stage('Create sonarqube project'){
+            steps{
+                script {
+                    withSonarQubeEnv('sonarqube87') {
+                     	sh 'curl -X POST -u ${SONAR_AUTH_TOKEN}: "${SONAR_HOST_URL}/api/projects/create?name='+PROJECT_NAME+'&project='+PROJECT_NAME+'"'
+                    }
+                }
+            }
+        }
+
+        stage('Finding Quality Gate id'){
+            steps{
+                script {
+                    sh 'sudo yum install jq -y'
+                    withSonarQubeEnv('sonarqube87') {
+                     	QGATE_ID = sh (returnStdout: true, script: 'curl -u ${SONAR_AUTH_TOKEN}: ${SONAR_HOST_URL}/api/qualitygates/list | jq --arg name "'+ SONAR_QGATE +'" \'.qualitygates | .[] | select(.name == $name).id\'')
+                    }
+                }
+
+            }
+        }
+
+        stage('Associating sonarqube project with quality gate'){
+            steps{
+                script {
+                    withSonarQubeEnv('sonarqube87') {
+                     	sh 'curl -X POST -u ${SONAR_AUTH_TOKEN}: "${SONAR_HOST_URL}/api/qualitygates/select?projectKey='+PROJECT_NAME+'&gateId='+QGATE_ID.trim()+'"'
+                    }
+                }
+
+            }
+        }
+
+        stage('Sonarqube analysis'){
+            steps{
+                script {
+                    withSonarQubeEnv('sonarqube87') {
+                        sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=${PROJECT_NAME} -Dsonar.projectVersion=${buildVersion}"
+                    }
+                }
+
+            }
+        }
+
+        stage("Quality Gate"){
+          steps {
+          	script {
+              timeout(time: 1, unit: 'HOURS') { // Just in case something goes wrong, pipeline will be killed after a timeout
+                def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+                println("quality gate :"+qg)
+                if (qg.status != 'OK') {
+                    echo "Pipeline aborted due to quality gate failure: ${qg.status}"
+                }
+              }
+            }
+          }
+        }
+
+        stage('Docker Push') {
+            steps {
+                script {
+                    echo "Docker image pushing to ECR"
+                    dockerOperations([action: 'push', registry: env.OPERATION_ENV, dockerObj: dockerImage])
+                }
+            }
+        }
+     /* stage('Deploy to EKS'){
+          steps {
+            script {
+              withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+              credentialsId: "devUSAwsCredentials",
+              accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+              secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+               sh """
+                  aws eks update-kubeconfig --region us-east-1 --name lotusdx-dev
+                  kubectl apply -f lotusdx.yaml
+                  """
+              }
+            }
+          }
+        }*/
+    }
+}
