@@ -1,0 +1,27 @@
+pipelineJob('DevOps/s3_global_copy') {
+    description("This job is for DEvOps team. It copies file from Source Env to Destination Env.")
+    parameters {
+        choiceParam('SRC_ENV', ['dev', 'testUS', 'testEU', 'prodUS', 'prodEU'], 'Source Environment')
+        choiceParam('DEST_ENV', ['dev', 'testUS', 'testEU', 'prodUS', 'prodEU'], 'Destination Environment')
+        stringParam('SRC_S3_URI', '', 'Enter Source S3 URI which is in format s3://xxxxx')
+        stringParam('DEST_S3_URI', '', 'Enter Destination S3 URI which is in format s3://xxxxx')
+        booleanParam('FILE', false,'Select this if you\'re copying single file')
+    }
+    definition {
+        cpsScm {
+            lightweight(true)
+            scm {
+                git {
+                    branch("master")
+                    remote {
+                        url('ssh://git@bitbucket.pieriandx.com/devops/jenkins-job-dsl.git')
+                        credentials('gitsshkey')
+                    }
+                }
+            }
+            scriptPath("DevOps/S3_Global_Copy/Jenkinsfile")
+        }
+    }
+}
+
+
