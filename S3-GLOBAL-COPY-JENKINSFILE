@@ -1,0 +1,113 @@
+pipeline{
+    agent{
+        label "ec2slave-t2med-od-maven"
+    }
+    stages{
+        stage("Setting Source AWS Credentials") {
+            steps {
+                script{
+                    if ( params.SRC_ENV == "dev") {
+                        SRC_AWS_CREDS = "devUSAwsCredentials"
+                        REGION = "us-east-1"
+                    } else if ( params.SRC_ENV == "testUS") {
+                        SRC_AWS_CREDS = "testUSAwsCredentials"
+                        REGION = "us-east-1"
+                    } else if ( params.SRC_ENV == "testEU") {
+                        SRC_AWS_CREDS = "testEUAwsCredentials"
+                        REGION = "eu-central-1"
+                    } else if ( params.SRC_ENV == "prodUS") {
+                        SRC_AWS_CREDS = "prodUSAwsCredentials"
+                        REGION = "us-east-1"
+                    } else if ( params.SRC_ENV == "prodEU") {
+                        SRC_AWS_CREDS = "prodEUAwsCredentials"
+                        REGION = "eu-central-1"
+                    }
+                    println "SRC_AWS_CREDS: ${SRC_AWS_CREDS}"
+                    println "AWS_REGION: ${REGION}"
+                }
+            }
+        }
+        stage("Setting Destination AWS Credentials") {
+            steps {
+                script{
+                    if ( params.DEST_ENV == "dev") {
+                        DEST_AWS_CREDS = "devUSAwsCredentials"
+                        REGION = "us-east-1"
+                    } else if ( params.DEST_ENV == "testUS") {
+                        DEST_AWS_CREDS = "testUSAwsCredentials"
+                        REGION = "us-east-1"
+                    } else if ( params.DEST_ENV == "testEU") {
+                        DEST_AWS_CREDS = "testEUAwsCredentials"
+                        REGION = "eu-central-1"
+                    } else if ( params.DEST_ENV == "prodUS") {
+                        DEST_AWS_CREDS = "prodUSAwsCredentials"
+                        REGION = "us-east-1"
+                    } else if ( params.DEST_ENV == "prodEU") {
+                        DEST_AWS_CREDS = "prodEUAwsCredentials"
+                        REGION = "eu-central-1"
+                    }
+                    println "DEST_AWS_CREDS: ${DEST_AWS_CREDS}"
+                    println "AWS_REGION: ${REGION}"
+                }
+            }
+        }
+        stage("Copying files from Source to Workspace"){
+            steps {
+                script {
+                    if(FILE == "true") {
+                        FILE_EXISTS = sh(returnStdout: true, script: '[[ -f ${WORKSPACE}/file ]] && rm -rf ${WORKSPACE}/file || echo "File does not exist"')
+                        println(FILE_EXISTS)
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: "${SRC_AWS_CREDS}", secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                            AWS_CLI_OUTPUT = sh(returnStdout: true, script: "aws s3 cp ${SRC_S3_URI} ${WORKSPACE}/file")
+                            if(AWS_CLI_OUTPUT?.trim())
+                                echo "${AWS_CLI_OUTPUT}"
+                            else 
+                                error("Build failed as path which is provided is a folder,unselect FILE parameter")  
+                        }                                             
+                    } else {
+                        FOLDER_EXISTS = sh(returnStdout: true, script: '[[ -d ${WORKSPACE}/folder ]] && rm -rf ${WORKSPACE}/folder || echo "Folder does not exist"')
+                        println(FOLDER_EXISTS)
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: "${SRC_AWS_CREDS}", secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                            AWS_CLI_OUTPUT = sh(returnStdout: true, script: "aws s3 cp ${SRC_S3_URI} ${WORKSPACE}/folder --recursive")
+                            if(AWS_CLI_OUTPUT?.trim())
+                                echo "${AWS_CLI_OUTPUT}"
+                            else 
+                                error("Build failed as path which is provided is a folder,unselect FILE parameter")  
+                        }
+                        if(AWS_CLI_OUTPUT?.trim())
+                            echo "${AWS_CLI_OUTPUT}"
+                        else 
+                            error("Build failed as path which is provided is a file, select FILE parameter")
+                    }
+                } 
+            }
+        }
+        stage("Copying files from Workspace to Destination"){
+            steps {
+                script {
+                    if(FILE == "true") {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: "${DEST_AWS_CREDS}", secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                            AWS_CLI_OUTPUT = sh(returnStdout: true, script: "aws s3 cp ${WORKSPACE}/file ${DEST_S3_URI} --sse")
+                            if(AWS_CLI_OUTPUT?.trim())
+                                echo "${AWS_CLI_OUTPUT}"
+                            else 
+                                error("Build failed as path which is provided is a folder,unselect FILE parameter")  
+                        }                                             
+                    } else {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: "${DEST_AWS_CREDS}", secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                            AWS_CLI_OUTPUT = sh(returnStdout: true, script: "aws s3 cp ${WORKSPACE}/folder ${DEST_S3_URI} --recursive --sse")
+                            if(AWS_CLI_OUTPUT?.trim())
+                                echo "${AWS_CLI_OUTPUT}"
+                            else 
+                                error("Build failed as path which is provided is a folder,unselect FILE parameter")  
+                        }
+                        if(AWS_CLI_OUTPUT?.trim())
+                            echo "${AWS_CLI_OUTPUT}"
+                        else 
+                            error("Build failed as path which is provided is a file, select FILE parameter")
+                    }
+                } 
+            }
+        }
+    }
+}
