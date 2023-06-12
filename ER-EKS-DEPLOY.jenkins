@@ -1,0 +1,27 @@
+pipelineJob('DevOps/ER_EKS_Deploy') {
+    description("Job for Deploying image to EKS Cluster for Redux-EvidenceReview Project")
+
+    parameters {
+        choiceParam('ENV', ['prodUS','prodEU'], 'Select the Environment')
+        choiceParam('ECR_REPO_NAME', ['evidencereview-prod','evidencereview-euprod'], 'Select ECR Repo to pull Image from')
+        stringParam('DOCKER_IMAGE_TAG_NAME', '','Enter name of Docker image tag')
+        stringParam('BRANCH_NAME', '','Enter name of git Branch')
+        stringParam('EKSServiceENVFile', '','Enter name of env file to update EKS service with, should be present at root directory')
+            }
+    definition {
+		cpsScm {
+			scm {
+                git {
+                    branch("*/\${BRANCH_NAME}")
+                    remote {
+                        url("ssh://git@bitbucket.pieriandx.com/red/evidence-review-backend.git")
+                        credentials('gitsshkey')
+                    }
+                }
+			}
+			scriptPath("devops/deploy/jenkinsFile")
+		}
+	}
+	disabled(false)
+    }
+
