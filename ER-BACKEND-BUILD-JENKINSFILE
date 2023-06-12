@@ -1,0 +1,246 @@
+pipeline{
+    agent { label 'ec2slave-t2med' } 
+	
+    tools {
+        nodejs 'node-16'
+    }
+    
+    environment {
+        def scannerHome = tool 'sonarqube87'
+        def packageJSONVersion = ''
+        def PROJECT_NAME = ''
+        def BUILD_S3_BUCKET = 'pdx-sam-build-bucket-dev'
+        def RELEASE_BUILD_S3_BUCKET = 'pdx-sam-build-bucket-release'
+        def buildVersion = ''
+        def credId = ''
+        def SONAR_QGATE = 'Sonar way - SP'
+        def SNYK_TOKEN_ID = 'red-snyk-api-token'
+    }
+    stages{
+        stage('Configure'){
+            steps {
+                // Calling this shared library function to get details of user who triggered the build
+               setBuildUserInfo()
+                script {
+                    //Set build decription for simplicity to identify who triggered build with which branch
+                   currentBuild.description = "${BUILD_USER} - ${branch}"
+                }
+            }
+        }
+
+        stage('Set Version'){
+            steps {
+               script {
+                    def packageJSON = readJSON file: 'package.json'
+                    packageJSONVersion = packageJSON.version
+                    PROJECT_NAME = packageJSON.name
+                    buildVersion = "${packageJSONVersion}-${BUILD_NUMBER}"
+                    if("${release}" == "true"){
+                        buildVersion = checkReleaseVersion(version,packageJSONVersion)
+                        echo "Tagging the commit with ${buildVersion}"
+                        sshagent(['gitsshkey']) {
+                           sh "git tag ${buildVersion}"
+                           sh "git push origin ${buildVersion}"
+                        }
+                    }
+                    slackNotifier('STARTED','#redux-build-deployments',"Build started for ${PROJECT_NAME} on branch ${branch} with version ${buildVersion}")
+                }
+            }
+        }
+
+        stage("Installing nest cli"){
+            steps{
+                script{
+                    sh "npm i -g @nestjs/cli"
+                }
+                
+            }
+        }
+        
+        stage("npm install"){
+            steps{
+                script{
+                    sh "npm install"
+                }
+                
+            }
+        }
+
+        stage("npm test"){
+            steps{
+                script{
+                    	sh "npm test --coverage;ls -ltrh"
+                }
+                
+            }
+        }
+        
+        // stage("Running snyk checks"){
+        //     steps{
+        //         script{
+        //             snykSecurity( 
+        //                 snykInstallation: 'snyk', 
+        //                 snykTokenId: SNYK_TOKEN_ID, 
+        //                 projectName: PROJECT_NAME, 
+        //                 severity: 'high'
+        //             )
+        //         }
+        //     }       
+        // }
+
+        stage('Create sonarqube project'){
+            steps{
+                script {
+                    withSonarQubeEnv('sonarqube87') {
+                     	sh 'curl -X POST -u ${SONAR_AUTH_TOKEN}: "${SONAR_HOST_URL}/api/projects/create?name='+PROJECT_NAME+'&project='+PROJECT_NAME+'"'
+                    }
+                }
+            }
+        }
+
+        stage('Finding Quality Gate id'){
+            steps{
+                script {
+                    sh 'sudo yum install jq -y'
+                    withSonarQubeEnv('sonarqube87') {
+                     	QGATE_ID = sh (returnStdout: true, script: 'curl -u ${SONAR_AUTH_TOKEN}: ${SONAR_HOST_URL}/api/qualitygates/list | jq --arg name "'+ SONAR_QGATE +'" \'.qualitygates | .[] | select(.name == $name).id\'')
+                    }
+                }
+
+            }
+        }
+
+        stage('Associating sonarqube project with quality gate'){
+            steps{
+                script {
+                    withSonarQubeEnv('sonarqube87') {
+                     	sh 'curl -X POST -u ${SONAR_AUTH_TOKEN}: "${SONAR_HOST_URL}/api/qualitygates/select?projectKey='+PROJECT_NAME+'&gateId='+QGATE_ID.trim()+'"'
+                    }
+                }
+
+            }
+        }
+        
+        stage('Sonarqube analysis'){
+            steps{
+                script {
+                    withSonarQubeEnv('sonarqube87') {
+                        sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=${PROJECT_NAME} -Dsonar.projectVersion=${buildVersion}"
+                    }
+                }
+
+            }
+        }
+
+        stage("Quality Gate"){
+          steps {
+          	script {
+              timeout(time: 1, unit: 'HOURS') { // Just in case something goes wrong, pipeline will be killed after a timeout
+                def qg = waitForQualityGate() // Reuse taskId previously collected by withSonarQubeEnv
+                println("quality gate :"+qg)
+                if (qg.status != 'OK') {
+                    echo "Pipeline aborted due to quality gate failure: ${qg.status}"
+                }
+              }
+            }
+          }
+        }
+        
+        stage("npm run build") {
+            steps {
+                script {
+                    sh "npm run build"
+                }
+            }
+        }
+        
+        stage("sam build") {
+            steps {
+                script {
+                    sh "sam build"
+                }
+            }
+        }
+        stage("Copying dist folder to sam artifcats") {
+            steps {
+                script {
+                    sh "cp dist .aws-sam/build/ApiFunction/ -a"
+                }
+            }
+        }
+        stage("sam package"){
+            steps {
+                script {
+                	credId = getCredentialsId(["action": "getCredentialId", "envType": "devUS"])
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: credId, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh(returnStdout: true, script: "sam package --s3-bucket ${BUILD_S3_BUCKET} --s3-prefix ${PROJECT_NAME}/${buildVersion} --region us-east-1 --output-template-file packaged.yaml")  
+                    }
+                }
+            }
+        }
+        stage("Copying packaged.yaml to build bucket"){
+            steps {
+                script {
+                	credId = getCredentialsId(["action": "getCredentialId", "envType": "devUS"])
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: credId, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh(returnStdout: true, script: "aws s3 cp ${WORKSPACE}/packaged.yaml s3://${BUILD_S3_BUCKET}/${PROJECT_NAME}/${buildVersion}/packaged.yaml --sse")  
+                    }
+                }
+            }
+        }
+        stage("sam package for release"){
+        	when {
+                expression { release == "true" }
+            }
+            steps {
+                script {
+                	credId = getCredentialsId(["action": "getCredentialId", "envType": "prodUS"])
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: credId, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh(returnStdout: true, script: "sam package --s3-bucket ${RELEASE_BUILD_S3_BUCKET} --s3-prefix ${PROJECT_NAME}/${buildVersion} --region us-east-1 --output-template-file packaged.yaml")  
+                    }
+                }
+            }
+        }
+        stage("Copying packaged.yaml to release build bucket"){
+        	when {
+                expression { release == "true" }
+            }
+            steps {
+                script {
+                	credId = getCredentialsId(["action": "getCredentialId", "envType": "prodUS"])
+                    withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: credId, secretKeyVariable: 'AWS_SECRET_ACCESS_KEY']]) {
+                        sh(returnStdout: true, script: "aws s3 cp ${WORKSPACE}/packaged.yaml s3://${RELEASE_BUILD_S3_BUCKET}/${PROJECT_NAME}/${buildVersion}/packaged.yaml --sse")  
+                    }
+                }
+            }
+        }
+        stage("Printing build version and branch"){
+        	steps {
+            	script {
+                	log.info("buildVersion : "+ buildVersion)
+                    log.info("branch : "+ branch)
+                }
+            }
+        }
+    }
+    post{
+        success{
+        	script {
+            	def BUILD_MSG = ""
+                if( release == "true" )
+                	BUILD_MSG = "Release "
+                BUILD_MSG = BUILD_MSG + "buildVersion created for ${PROJECT_NAME} on branch ${branch} : " + buildVersion
+            	slackNotifier(currentBuild.currentResult,'#redux-build-deployments', BUILD_MSG)
+            }
+        }
+       failure{
+        	script {
+            	def BUILD_MSG = ""
+                if( release == "true" )
+                	BUILD_MSG = "Release "
+                BUILD_MSG = BUILD_MSG + "buildVersion failed for ${PROJECT_NAME} on branch ${branch} : " + buildVersion
+            	slackNotifier(currentBuild.currentResult,'#redux-build-deployments', BUILD_MSG)
+            }
+        }  
+    }
+}
