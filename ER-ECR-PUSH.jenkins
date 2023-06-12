@@ -1,0 +1,29 @@
+pipelineJob('DevOps/ER_ECR_Push') {
+    description("Job for building and pushing images to ECR for Redux-EvidenceReview Project")
+
+    parameters {
+        choiceParam('OPERATION_ENV', ['prod','euprod'], 'Select the target ENV to push Image')
+        stringParam('DOCKER_IMAGE_TAG_NAME', '','Enter name of Docker image tag')
+        choiceParam('ECR_REPO_NAME', ['evidencereview-prod','evidencereview-euprod'], 'Select ECR Repo to push Image')
+        stringParam('BRANCH_NAME', '','Enter name of git Branch')
+        stringParam('DOCKER_FILE_LOCATION', 'evidence-review-backend', 'Default location of dockerfile in repo')
+            }
+    definition {
+		cpsScm {
+			scm {
+                git {
+                    branch("*/\${BRANCH_NAME}")
+                    remote {
+                        url("ssh://git@bitbucket.pieriandx.com/red/evidence-review-backend.git")
+                        credentials('gitsshkey')
+                    }
+                }
+			}
+			scriptPath("devops/build/jenkinsFile")
+		}
+	}
+	disabled(false)
+    }
+
+
+
